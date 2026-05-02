@@ -179,7 +179,6 @@ async def render_nav(event, nav_id, edit=True):
 
     msg_obj = await event.edit("Loading...") if edit else await event.reply("Loading...")
 
-    # Fetch fresh directory structure if path changed or not loaded yet
     if "items" not in session or session.get("last_path") != current_path:
         await msg_obj.edit(f"Fetching contents of /{current_path}...")
         
@@ -208,7 +207,6 @@ async def render_nav(event, nav_id, edit=True):
     page = session.get("page", 0)
     ITEMS_PER_PAGE = 8
 
-    # Calculate pagination logic
     total_pages = max(1, (len(items) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
     if page >= total_pages: page = total_pages - 1
     if page < 0: page = 0
@@ -230,14 +228,13 @@ async def render_nav(event, nav_id, edit=True):
         else:
             buttons.append([Button.inline(f"File: {name_trunc}", f"navdl_{nav_id}_{actual_idx}".encode())])
 
-    # Add Navigation Controls
     nav_row = []
     if page > 0:
-        nav_row.append(Button.inline("Prev Page", f"navpg_{nav_id}_{page-1}".encode()))
+        nav_row.append(Button.inline("Prev", f"navpg_{nav_id}_{page-1}".encode()))
     if total_pages > 1:
         nav_row.append(Button.inline(f"{page+1} / {total_pages}", b"noop"))
     if page < total_pages - 1:
-        nav_row.append(Button.inline("Next Page", f"navpg_{nav_id}_{page+1}".encode()))
+        nav_row.append(Button.inline("Next", f"navpg_{nav_id}_{page+1}".encode()))
         
     if nav_row:
         buttons.append(nav_row)
@@ -317,9 +314,13 @@ async def cb_navdl(event):
 
     if filename.lower().endswith(".cbz"):
         await event.edit(f"Streaming {filename} directly from Google Drive...")
-        # Add safe="/" to ensure subdirectories pass correctly to the web server
+        
+        # Scopes the stream securely to your specific Folder ID to prevent 404s
+        remote_base = RCLONE_REMOTE.rstrip(':')
+        dynamic_remote = f"[{remote_base},root_folder_id={root_id}:]"
         encoded_path = urllib.parse.quote(file_path, safe="/")
-        url = f"http://127.0.0.1:8081/{encoded_path}"
+        url = f"http://127.0.0.1:8081/{dynamic_remote}/{encoded_path}"
+        
         await register_session_and_prompt(event, "stream_cbz", url)
     else:
         await event.edit(f"CBR format requires local extraction. Downloading {filename} via rclone...")
@@ -408,8 +409,9 @@ async def cb_noop(event):
 
 # --- STARTUP SCRIPT ---
 async def main():
-    print("Booting local rclone stream server...", flush=True)
-    subprocess.Popen(f'rclone serve http "{RCLONE_REMOTE}" --addr 127.0.0.1:8081', shell=True)
+    # Use rcd (Remote Control Daemon) to expose the VFS layer for targeted HTTP streaming
+    print("Booting local rclone VFS stream server...", flush=True)
+    subprocess.Popen(['rclone', 'rcd', '--rc-no-auth', '--rc-serve', '--rc-addr', '127.0.0.1:8081'])
 
     print("Initializing Web Server...", flush=True)
     web_app = web.Application()
