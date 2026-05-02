@@ -24,7 +24,7 @@ RCLONE_REMOTE = os.environ.get("RCLONE_REMOTE", "gdrive:")
 if not BOT_TOKEN or not API_ID:
     raise ValueError("CRITICAL ERROR: BOT_TOKEN or API_ID is missing!")
 
-# Client is defined normally, letting it bind to the active loop later
+# in_memory=True kills the cache trap, ensuring it reads the live token
 app = Client("comic_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
 
 # In-memory stores
@@ -386,9 +386,8 @@ async def cb_noop(client, callback_query):
     await callback_query.answer()
 
 # --- STARTUP SCRIPT ---
-async def start_services():
+async def main():
     print("Booting local rclone stream server...", flush=True)
-    # Safely detach the rclone stream server to the OS background
     subprocess.Popen(f'rclone serve http "{RCLONE_REMOTE}" --addr 127.0.0.1:8081', shell=True)
 
     print("Initializing Web Server...", flush=True)
@@ -400,18 +399,18 @@ async def start_services():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    print(f"Web server active on port {PORT}!", flush=True)
     
-    print("Booting Pyrogram bot...", flush=True)
-    await app.start()
+    print(f"Web server active on port {PORT}!", flush=True)
     print("Bot is fully online and synchronized!", flush=True)
     
+    # Pyrogram app.run() starts the client in the background already.
+    # idle() simply blocks the coroutine to keep the process alive while it listens for updates.
     await idle()
     
     print("Shutting down...", flush=True)
-    await app.stop()
     await runner.cleanup()
 
 if __name__ == "__main__":
-    # The ultimate guarantee that all components share the exact same async loop
-    asyncio.run(start_services())
+    # app.run() acts as the ultimate loop creator. It boots Pyrogram properly, 
+    # executes our main() function containing the web server setup, and cleanly shuts down.
+    app.run(main())
