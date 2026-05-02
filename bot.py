@@ -24,7 +24,7 @@ if not BOT_TOKEN:
 if not API_ID or not API_HASH:
     raise ValueError("CRITICAL ERROR: API_ID or API_HASH is missing!")
 
-# in_memory=True forces it to use the current token, preventing the session cache trap
+# Client is defined here, but loop binding is now deferred to app.run()
 app = Client("comic_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
 
 # In-memory state stores
@@ -159,13 +159,12 @@ async def process_downloaded_archive(message_obj, filepath):
 
 @app.on_message(filters.command("start"))
 async def start_cmd(client, message):
-    print("Start command triggered.", flush=True)
+    print("Received /start command", flush=True)
     await message.reply("Send me a .cbz or .cbr file, or paste a Google Drive folder link to begin.")
 
 @app.on_message(filters.document)
 async def handle_document(client, message):
-    print(f"Document received from user {message.from_user.id}", flush=True)
-    
+    print("Received document", flush=True)
     file_name = getattr(message.document, "file_name", "") or ""
     ext = file_name.split('.')[-1].lower() if '.' in file_name else ""
     
@@ -178,8 +177,7 @@ async def handle_document(client, message):
 
 @app.on_message(filters.text & filters.regex(r"drive\.google\.com"))
 async def handle_link(client, message):
-    print(f"Drive link received from user {message.from_user.id}", flush=True)
-    
+    print("Received Drive link", flush=True)
     folder_id = extract_drive_id(message.text)
     if not folder_id:
         return await message.reply("Could not extract a valid Drive ID from that link.")
@@ -323,15 +321,18 @@ async def handle_jump_input(client, message):
             
         except ValueError:
             await message.reply("Please send a valid number.")
+            return
 
 # Catch-all placed at the very bottom
 @app.on_message(filters.private)
 async def catch_all(client, message):
-    print(f"Unrecognized message received.", flush=True)
+    print("Received unrecognized message", flush=True)
     await message.reply("I only recognize .cbz files, .cbr files, or Google Drive links.")
 
-# --- STARTUP SCRIPT ---
-async def main():
+
+# --- THE MASTER EVENT LOOP MANAGER ---
+async def start_web_server():
+    """This function runs entirely inside Pyrogram's established event loop."""
     print("Initializing Web Server...", flush=True)
     web_app = web.Application()
     web_app.router.add_get('/read/{session_id}', web_read_page)
@@ -343,17 +344,15 @@ async def main():
     
     print(f"Binding web server to port {PORT}...", flush=True)
     await site.start()
-    print("Web server started successfully!", flush=True)
+    print("Web server started successfully! Bot is fully active.", flush=True)
     
-    print("Authenticating Telegram Bot...", flush=True)
-    await app.start()
-    print("Telegram Bot is online and listening!", flush=True)
-    
+    # Block the coroutine to keep the web server alive while Pyrogram listens
     await idle()
     
-    await app.stop()
+    print("Shutting down...", flush=True)
     await runner.cleanup()
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    print("Booting Pyrogram master loop...", flush=True)
+    # app.run() automatically creates the loop, starts the client, runs the coroutine, then stops the client safely.
+    app.run(start_web_server())
