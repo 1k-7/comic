@@ -73,12 +73,14 @@ def build_keyboard(session_id, current_page, total_pages):
         
     return [row1, [Button.inline("Jump to Page", f"jump_{session_id}".encode())]]
 
-# --- WEB SERVER ROUTES ---
+# --- WEB SERVER ROUTES (WITH PRELOADING FIXES) ---
 async def web_read_page(request):
     session_id = request.match_info.get('session_id')
     if session_id not in sessions:
         return web.Response(text="Session expired or invalid.", status=404)
     total = sessions[session_id]["total"]
+    
+    # HTML now includes a background JavaScript preloader so pages flip instantly
     html = f"""
     <!DOCTYPE html>
     <html>
@@ -86,29 +88,60 @@ async def web_read_page(request):
         <title>Comic Reader</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
-            body {{ background: #121212; color: white; text-align: center; margin: 0; padding: 0; font-family: sans-serif; }}
+            body {{ background: #121212; color: white; text-align: center; margin: 0; padding: 0; font-family: sans-serif; overflow-x: hidden; }}
+            #viewer {{ display: flex; align-items: center; justify-content: center; min-height: 90vh; cursor: pointer; }}
             img {{ max-width: 100%; height: auto; max-height: 90vh; object-fit: contain; }}
-            .controls {{ padding: 10px; background: #222; position: fixed; bottom: 0; width: 100%; display: flex; justify-content: center; gap: 20px; }}
-            button {{ padding: 10px 20px; background: #333; color: white; border: 1px solid #555; cursor: pointer; }}
+            .controls {{ padding: 10px; background: #222; position: fixed; bottom: 0; width: 100%; display: flex; justify-content: center; gap: 20px; box-shadow: 0 -2px 10px rgba(0,0,0,0.5); }}
+            button {{ padding: 12px 24px; background: #333; color: white; border: 1px solid #555; border-radius: 4px; cursor: pointer; font-size: 16px; }}
+            button:active {{ background: #555; }}
+            #loading {{ display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(0,0,0,0.8); padding: 10px 20px; border-radius: 8px; font-weight: bold; pointer-events: none; }}
         </style>
     </head>
     <body>
-        <div id="viewer"><img id="comic-page" src="/api/image/{session_id}/0" /></div>
+        <div id="loading">Loading Page...</div>
+        <div id="viewer" onclick="changePage(1)"><img id="comic-page" src="/api/image/{session_id}/0" onload="hideLoading()" onerror="hideLoading()"/></div>
         <div class="controls">
-            <button onclick="changePage(-1)">Back</button>
-            <span id="page-counter" style="align-self: center;">1 / {total}</span>
-            <button onclick="changePage(1)">Next</button>
+            <button onclick="changePage(-1); event.stopPropagation();">Back</button>
+            <span id="page-counter" style="align-self: center; font-size: 16px;">1 / {total}</span>
+            <button onclick="changePage(1); event.stopPropagation();">Next</button>
         </div>
         <script>
-            let currentPage = 0; const totalPages = {total}; const sessionId = "{session_id}";
+            let currentPage = 0; 
+            const totalPages = {total}; 
+            const sessionId = "{session_id}";
+            const imgEl = document.getElementById('comic-page');
+            const loader = document.getElementById('loading');
+            
+            function showLoading() {{ loader.style.display = 'block'; }}
+            function hideLoading() {{ loader.style.display = 'none'; }}
+            
+            // Forces the browser to fetch the image in the background before you even click next
+            function preload(page) {{
+                if (page >= 0 && page < totalPages) {{
+                    new Image().src = `/api/image/${{sessionId}}/${{page}}`;
+                }}
+            }}
+
             function changePage(dir) {{
-                currentPage += dir;
-                if (currentPage < 0) currentPage = 0;
-                if (currentPage >= totalPages) currentPage = totalPages - 1;
-                document.getElementById('comic-page').src = `/api/image/${{sessionId}}/${{currentPage}}`;
+                let newPage = currentPage + dir;
+                if (newPage < 0 || newPage >= totalPages) return;
+                
+                currentPage = newPage;
+                showLoading();
+                imgEl.src = `/api/image/${{sessionId}}/${{currentPage}}`;
                 document.getElementById('page-counter').innerText = `${{currentPage + 1}} / ${{totalPages}}`;
                 window.scrollTo(0,0);
+                
+                // Immediately preload the next two pages
+                preload(currentPage + 1);
+                preload(currentPage + 2);
             }}
+            
+            // Preload pages 2 and 3 as soon as the reader opens
+            window.onload = () => {{
+                preload(1);
+                preload(2);
+            }};
         </script>
     </body>
     </html>
@@ -315,7 +348,6 @@ async def cb_navdl(event):
     if filename.lower().endswith(".cbz"):
         await event.edit(f"Streaming {filename} directly from Google Drive...")
         
-        # Scopes the stream securely to your specific Folder ID to prevent 404s
         remote_base = RCLONE_REMOTE.rstrip(':')
         dynamic_remote = f"[{remote_base},root_folder_id={root_id}:]"
         encoded_path = urllib.parse.quote(file_path, safe="/")
@@ -358,13 +390,18 @@ async def cb_pm_read(event):
     try:
         img_bytes = await asyncio.to_thread(extract_page, sess["type"], sess["source"], filename)
         kb = build_keyboard(session_id, page_idx, sess["total"])
-        mem_file = (filename, img_bytes)
+        
+        # FIX: Force io.BytesIO stream with a name so Telethon validates it as a photo
+        bio = io.BytesIO(img_bytes)
+        bio.name = filename 
 
         if action == "pm":
+            # Deletes the text prompt and sends the first image
             await event.delete()
-            await bot.send_file(event.chat_id, file=mem_file, buttons=kb)
+            await bot.send_message(event.chat_id, file=bio, buttons=kb)
         elif action == "nav":
-            await event.edit(file=mem_file, buttons=kb)
+            # Edits the existing image message to the new page
+            await event.edit(file=bio, buttons=kb)
     except Exception as e:
         await event.answer(f"Failed to load page: {str(e)}", alert=True)
 
@@ -393,9 +430,12 @@ async def handle_text(event):
             filename = sess["pages"][target_page]
             img_bytes = await asyncio.to_thread(extract_page, sess["type"], sess["source"], filename)
             
+            bio = io.BytesIO(img_bytes)
+            bio.name = filename
+            
             kb = build_keyboard(session_id, target_page, sess["total"])
             
-            await event.reply(file=(filename, img_bytes), buttons=kb)
+            await event.reply(file=bio, buttons=kb)
             del jump_states[user_id]
             
         except ValueError:
@@ -409,7 +449,6 @@ async def cb_noop(event):
 
 # --- STARTUP SCRIPT ---
 async def main():
-    # Use rcd (Remote Control Daemon) to expose the VFS layer for targeted HTTP streaming
     print("Booting local rclone VFS stream server...", flush=True)
     subprocess.Popen(['rclone', 'rcd', '--rc-no-auth', '--rc-serve', '--rc-addr', '127.0.0.1:8081'])
 
