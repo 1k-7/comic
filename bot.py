@@ -7,8 +7,9 @@ import zipfile
 import rarfile
 import re
 import urllib.parse
+import subprocess
 from aiohttp import web
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 from remotezip import RemoteZip
 
@@ -23,6 +24,7 @@ RCLONE_REMOTE = os.environ.get("RCLONE_REMOTE", "gdrive:")
 if not BOT_TOKEN or not API_ID:
     raise ValueError("CRITICAL ERROR: BOT_TOKEN or API_ID is missing!")
 
+# Client is defined normally, letting it bind to the active loop later
 app = Client("comic_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # In-memory stores
@@ -32,7 +34,7 @@ jump_states = {}   # user_id -> session_id
 
 # --- UTILITIES ---
 def extract_drive_id(url):
-    match = re.search(r"/d/([a-zA-Z0-9_-]+)", url)
+    match = re.search(r"/(?:d|folders)/([a-zA-Z0-9_-]+)", url)
     if match: return match.group(1)
     match = re.search(r"id=([a-zA-Z0-9_-]+)", url)
     return match.group(1) if match else None
@@ -145,22 +147,22 @@ async def register_session_and_prompt(message_obj, file_type, source):
     ])
     await message_obj.edit_text("File processed. Choose your reading method:", reply_markup=kb)
 
-
 @app.on_message(filters.command("start"))
 async def start_cmd(client, message):
+    print(f"Received /start from {message.from_user.id}", flush=True)
     await message.reply("Send me a .cbz or .cbr file, or paste a Google Drive folder link to begin.")
 
 @app.on_message(filters.document)
 async def handle_document(client, message):
+    print("Received document", flush=True)
     file_name = getattr(message.document, "file_name", "") or ""
     ext = file_name.split('.')[-1].lower() if '.' in file_name else ""
     
     if ext not in ['cbz', 'cbr']:
         return await message.reply("Please send a valid .cbz or .cbr file.")
         
-    msg = await message.reply("Downloading massive file via MTProto... this may take a moment.")
+    msg = await message.reply("Downloading file via MTProto... this may take a moment for large files.")
     
-    # Pyrogram handles direct Telegram uploads via local disk
     os.makedirs("downloads", exist_ok=True)
     filepath = await message.download(file_name=f"downloads/{file_name}")
     
@@ -222,6 +224,7 @@ async def render_nav(message_obj, nav_id, edit=True):
 
 @app.on_message(filters.text & filters.regex(r"drive\.google\.com"))
 async def handle_link(client, message):
+    print("Received Google Drive link", flush=True)
     folder_id = extract_drive_id(message.text)
     if not folder_id:
         return await message.reply("Could not extract a valid Drive ID.")
@@ -279,7 +282,6 @@ async def cb_navdl(client, callback_query):
 
     if filename.lower().endswith(".cbz"):
         await callback_query.message.edit_text(f"Streaming {filename} directly from Google Drive...")
-        # URL encode the rclone path so remotezip can read it from the local HTTP server
         encoded_path = urllib.parse.quote(file_path)
         url = f"http://127.0.0.1:8081/{encoded_path}"
         await register_session_and_prompt(callback_query.message, "stream_cbz", url)
@@ -298,7 +300,6 @@ async def cb_navdl(client, callback_query):
             return await callback_query.message.edit_text(f"Download failed.\nError: {stderr.decode('utf-8')}")
 
         await register_session_and_prompt(callback_query.message, "local_cbr", local_filepath)
-
 
 @app.on_callback_query(filters.regex(r"^web_(.*)"))
 async def cb_web_read(client, callback_query):
@@ -385,29 +386,32 @@ async def cb_noop(client, callback_query):
     await callback_query.answer()
 
 # --- STARTUP SCRIPT ---
-def main():
-    loop = asyncio.get_event_loop()
-
-    # 1. Start Rclone local HTTP server to enable remotezip streaming
+async def start_services():
     print("Booting local rclone stream server...", flush=True)
-    rclone_cmd = f'rclone serve http "{RCLONE_REMOTE}" --addr 127.0.0.1:8081'
-    loop.run_until_complete(asyncio.create_subprocess_shell(rclone_cmd))
+    # Safely detach the rclone stream server to the OS background
+    subprocess.Popen(f'rclone serve http "{RCLONE_REMOTE}" --addr 127.0.0.1:8081', shell=True)
 
-    # 2. Boot Web Server
     print("Initializing Web Server...", flush=True)
     web_app = web.Application()
     web_app.router.add_get('/read/{session_id}', web_read_page)
     web_app.router.add_get('/api/image/{session_id}/{page_idx}', web_serve_image)
     
     runner = web.AppRunner(web_app)
-    loop.run_until_complete(runner.setup())
+    await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
-    loop.run_until_complete(site.start())
+    await site.start()
     print(f"Web server active on port {PORT}!", flush=True)
     
-    # 3. Boot Pyrogram
-    print("Booting Pyrogram to handle MTProto limits...", flush=True)
-    app.run()
+    print("Booting Pyrogram bot...", flush=True)
+    await app.start()
+    print("Bot is fully online and synchronized!", flush=True)
+    
+    await idle()
+    
+    print("Shutting down...", flush=True)
+    await app.stop()
+    await runner.cleanup()
 
 if __name__ == "__main__":
-    main()
+    # The ultimate guarantee that all components share the exact same async loop
+    asyncio.run(start_services())
