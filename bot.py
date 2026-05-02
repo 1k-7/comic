@@ -331,7 +331,9 @@ async def main():
     await app.start()
     print("Telegram Bot is online and listening!", flush=True)
     
+    # Keep the script running forever
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    app.run(main())
+    # Standard asyncio execution loop
+    asyncio.run(main())
