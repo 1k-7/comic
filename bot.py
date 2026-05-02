@@ -24,7 +24,8 @@ if not BOT_TOKEN:
 if not API_ID or not API_HASH:
     raise ValueError("CRITICAL ERROR: API_ID or API_HASH is missing!")
 
-app = Client("comic_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# in_memory=True forces it to use the current token, preventing the session cache trap
+app = Client("comic_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
 
 # In-memory state stores
 sessions = {}
@@ -217,11 +218,6 @@ async def handle_link(client, message):
     kb = InlineKeyboardMarkup(buttons)
     await msg.edit("Select a comic archive to read:", reply_markup=kb)
 
-@app.on_message(filters.private & ~filters.document & ~filters.command("start") & ~filters.regex(r"drive\.google\.com"))
-async def catch_all(client, message):
-    print(f"Unrecognized message received: {message.text or 'Non-text media'}", flush=True)
-    await message.reply("I only recognize .cbz files, .cbr files, or Google Drive links.")
-
 @app.on_callback_query(filters.regex(r"^rcdl_(.*)"))
 async def cb_rclone_download(client, callback_query):
     download_id = callback_query.data.split("_")[1]
@@ -328,6 +324,12 @@ async def handle_jump_input(client, message):
         except ValueError:
             await message.reply("Please send a valid number.")
 
+# Catch-all placed at the very bottom
+@app.on_message(filters.private)
+async def catch_all(client, message):
+    print(f"Unrecognized message received.", flush=True)
+    await message.reply("I only recognize .cbz files, .cbr files, or Google Drive links.")
+
 # --- STARTUP SCRIPT ---
 async def main():
     print("Initializing Web Server...", flush=True)
@@ -353,4 +355,5 @@ async def main():
     await runner.cleanup()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
