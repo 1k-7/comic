@@ -27,7 +27,6 @@ RCLONE_REMOTE = os.environ.get("RCLONE_REMOTE", "gdrive:")
 if not BOT_TOKEN or not API_ID:
     raise ValueError("CRITICAL ERROR: BOT_TOKEN or API_ID is missing!")
 
-# Initialize Telethon Client
 bot = TelegramClient('comic_bot', API_ID, API_HASH)
 
 # In-memory stores
@@ -159,7 +158,7 @@ async def handle_document(event):
     if ext not in ['cbz', 'cbr']:
         return await event.reply("Please send a valid .cbz or .cbr file.")
         
-    msg = await event.reply("Downloading massive file via MTProto... this may take a moment.")
+    msg = await event.reply("Downloading Telegram file locally... (Telegram MTProto limits prevent streaming directly).")
     
     os.makedirs("downloads", exist_ok=True)
     filepath = os.path.join("downloads", file_name)
@@ -168,7 +167,7 @@ async def handle_document(event):
     file_type = "local_cbz" if ext == "cbz" else "local_cbr"
     await register_session_and_prompt(msg, file_type, filepath)
 
-# --- FOLDER TRAVERSAL & GOOGLE DRIVE STREAMING ---
+# --- FOLDER TRAVERSAL WITH PAGINATION ---
 async def render_nav(event, nav_id, edit=True):
     session = nav_sessions.get(nav_id)
     if not session:
@@ -178,39 +177,70 @@ async def render_nav(event, nav_id, edit=True):
     root_id = session["root_id"]
     current_path = session["current_path"]
 
-    status_text = f"Fetching contents of /{current_path}..."
-    msg_obj = await event.edit(status_text) if edit else await event.reply(status_text)
+    msg_obj = await event.edit("Loading...") if edit else await event.reply("Loading...")
 
-    cmd = f'rclone lsjson "{RCLONE_REMOTE}{current_path}" --drive-root-folder-id "{root_id}"'
-    proc = await asyncio.create_subprocess_shell(
-        cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-    stdout, stderr = await proc.communicate()
+    # Fetch fresh directory structure if path changed or not loaded yet
+    if "items" not in session or session.get("last_path") != current_path:
+        await msg_obj.edit(f"Fetching contents of /{current_path}...")
+        
+        cmd = f'rclone lsjson "{RCLONE_REMOTE}{current_path}" --drive-root-folder-id "{root_id}"'
+        proc = await asyncio.create_subprocess_shell(
+            cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await proc.communicate()
 
-    if proc.returncode != 0:
-        return await msg_obj.edit(f"Rclone failed.\nError: {stderr.decode('utf-8')}")
+        if proc.returncode != 0:
+            return await msg_obj.edit(f"Rclone failed.\nError: {stderr.decode('utf-8')}")
 
-    try:
-        items = json.loads(stdout.decode('utf-8'))
-    except json.JSONDecodeError:
-        return await msg_obj.edit("Failed to parse rclone output.")
+        try:
+            items = json.loads(stdout.decode('utf-8'))
+        except json.JSONDecodeError:
+            return await msg_obj.edit("Failed to parse rclone output.")
 
-    folders = [i for i in items if i['IsDir']]
-    files = [i for i in items if not i['IsDir'] and i['Name'].lower().endswith(('.cbz', '.cbr'))]
+        folders = [i for i in items if i['IsDir']]
+        files = [i for i in items if not i['IsDir'] and i['Name'].lower().endswith(('.cbz', '.cbr'))]
 
-    session["items"] = folders + files
-    num_folders = len(folders)
+        session["items"] = folders + files
+        session["page"] = 0
+        session["last_path"] = current_path
+
+    items = session["items"]
+    page = session.get("page", 0)
+    ITEMS_PER_PAGE = 8
+
+    # Calculate pagination logic
+    total_pages = max(1, (len(items) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+    if page >= total_pages: page = total_pages - 1
+    if page < 0: page = 0
+    session["page"] = page
+
+    start_idx = page * ITEMS_PER_PAGE
+    end_idx = start_idx + ITEMS_PER_PAGE
+    page_items = items[start_idx:end_idx]
 
     buttons = []
     if current_path != "":
         buttons.append([Button.inline("Back to Previous Folder", f"navup_{nav_id}".encode())])
 
-    for i, item in enumerate(folders):
-        buttons.append([Button.inline(f"Dir: {item['Name']}", f"navdown_{nav_id}_{i}".encode())])
+    for i, item in enumerate(page_items):
+        actual_idx = start_idx + i
+        name_trunc = item['Name'][:40] + ("..." if len(item['Name']) > 40 else "")
+        if item['IsDir']:
+            buttons.append([Button.inline(f"Dir: {name_trunc}", f"navdown_{nav_id}_{actual_idx}".encode())])
+        else:
+            buttons.append([Button.inline(f"File: {name_trunc}", f"navdl_{nav_id}_{actual_idx}".encode())])
 
-    for i, item in enumerate(files):
-        idx = i + num_folders
-        buttons.append([Button.inline(f"File: {item['Name']}", f"navdl_{nav_id}_{idx}".encode())])
+    # Add Navigation Controls
+    nav_row = []
+    if page > 0:
+        nav_row.append(Button.inline("Prev Page", f"navpg_{nav_id}_{page-1}".encode()))
+    if total_pages > 1:
+        nav_row.append(Button.inline(f"{page+1} / {total_pages}", b"noop"))
+    if page < total_pages - 1:
+        nav_row.append(Button.inline("Next Page", f"navpg_{nav_id}_{page+1}".encode()))
+        
+    if nav_row:
+        buttons.append(nav_row)
 
     if not buttons:
         buttons.append([Button.inline("Empty Directory", b"noop")])
@@ -229,6 +259,19 @@ async def handle_link(event):
         "current_path": ""
     }
     await render_nav(event, nav_id, edit=False)
+
+@bot.on(events.CallbackQuery(pattern=b"^navpg_(.*)"))
+async def cb_navpg(event):
+    parts = event.data.decode().split("_")
+    nav_id = parts[1]
+    page = int(parts[2])
+    
+    session = nav_sessions.get(nav_id)
+    if not session:
+        return await event.answer("Session expired.", alert=True)
+
+    session["page"] = page
+    await render_nav(event, nav_id, edit=True)
 
 @bot.on(events.CallbackQuery(pattern=b"^navup_(.*)"))
 async def cb_navup(event):
@@ -274,7 +317,8 @@ async def cb_navdl(event):
 
     if filename.lower().endswith(".cbz"):
         await event.edit(f"Streaming {filename} directly from Google Drive...")
-        encoded_path = urllib.parse.quote(file_path)
+        # Add safe="/" to ensure subdirectories pass correctly to the web server
+        encoded_path = urllib.parse.quote(file_path, safe="/")
         url = f"http://127.0.0.1:8081/{encoded_path}"
         await register_session_and_prompt(event, "stream_cbz", url)
     else:
@@ -313,8 +357,6 @@ async def cb_pm_read(event):
     try:
         img_bytes = await asyncio.to_thread(extract_page, sess["type"], sess["source"], filename)
         kb = build_keyboard(session_id, page_idx, sess["total"])
-        
-        # Telethon allows passing tuples for in-memory files: (filename, bytes)
         mem_file = (filename, img_bytes)
 
         if action == "pm":
@@ -382,11 +424,9 @@ async def main():
     print(f"Web server active on port {PORT}!", flush=True)
     print("Booting Telethon MTProto Client...", flush=True)
     
-    # Start the bot within the exact same asyncio loop
     await bot.start(bot_token=BOT_TOKEN)
     print("Bot is fully online, synchronized, and listening!", flush=True)
     
-    # Keeps the loop running
     await bot.run_until_disconnected()
 
 if __name__ == "__main__":
