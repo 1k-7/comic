@@ -1,4 +1,3 @@
-pyrogram
-tgcrypto
+aiogram
 aiohttp
 rarfile
