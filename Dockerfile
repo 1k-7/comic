@@ -1,5 +1,8 @@
 FROM python:3.11-slim
 
+# Force Python to print logs immediately so Northflank shows them
+ENV PYTHONUNBUFFERED=1
+
 # Enable the "non-free" repository in Debian to access the official unrar package
 RUN sed -i 's/Components: main/Components: main non-free/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
     sed -i 's/ main$/ main non-free/g' /etc/apt/sources.list

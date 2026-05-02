@@ -11,12 +11,18 @@ from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 
 # --- CONFIGURATION ---
-API_ID = os.environ.get("API_ID", "your_api_id")
-API_HASH = os.environ.get("API_HASH", "your_api_hash")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token")
+API_ID = os.environ.get("API_ID")
+API_HASH = os.environ.get("API_HASH")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WEB_DOMAIN = os.environ.get("WEB_DOMAIN", "https://your-app.northflank.app")
 PORT = int(os.environ.get("PORT", 8080))
 RCLONE_REMOTE = os.environ.get("RCLONE_REMOTE", "gdrive:")
+
+# --- CRASH CHECKS ---
+if not BOT_TOKEN:
+    raise ValueError("CRITICAL ERROR: BOT_TOKEN is missing! Check your environment variables.")
+if not API_ID or not API_HASH:
+    raise ValueError("CRITICAL ERROR: API_ID or API_HASH is missing!")
 
 app = Client("comic_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -308,6 +314,7 @@ async def handle_jump_input(client, message):
 
 # --- STARTUP SCRIPT ---
 async def main():
+    print("Initializing Web Server...", flush=True)
     web_app = web.Application()
     web_app.router.add_get('/read/{session_id}', web_read_page)
     web_app.router.add_get('/api/image/{session_id}/{page_idx}', web_serve_image)
@@ -316,11 +323,13 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     
-    print(f"Starting web server on port {PORT}...")
+    print(f"Binding web server to port {PORT}...", flush=True)
     await site.start()
+    print("Web server started successfully!", flush=True)
     
-    print("Starting Telegram Bot...")
+    print("Authenticating Telegram Bot...", flush=True)
     await app.start()
+    print("Telegram Bot is online and listening!", flush=True)
     
     await asyncio.Event().wait()
 
