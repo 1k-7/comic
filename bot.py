@@ -7,7 +7,7 @@ import zipfile
 import rarfile
 import re
 from aiohttp import web
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 
 # --- CONFIGURATION ---
@@ -28,7 +28,7 @@ app = Client("comic_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # In-memory state stores
 sessions = {}
-jump_states = {} # user_id -> session_id
+jump_states = {}
 
 # --- UTILITIES ---
 def extract_drive_id(url):
@@ -156,55 +156,71 @@ async def process_downloaded_archive(message_obj, filepath):
     ])
     await message_obj.edit("File processed. Choose your reading method:", reply_markup=kb)
 
-@app.on_message(filters.document | filters.regex(r"drive\.google\.com"))
-async def handle_files(client, message):
-    if message.document:
-        ext = message.document.file_name.split('.')[-1].lower()
-        if ext not in ['cbz', 'cbr']:
-            return await message.reply("Please send a valid .cbz or .cbr file.")
-            
-        msg = await message.reply("Downloading file...")
-        filepath = await message.download()
-        await process_downloaded_archive(msg, filepath)
+@app.on_message(filters.command("start"))
+async def start_cmd(client, message):
+    print("Start command triggered.", flush=True)
+    await message.reply("Send me a .cbz or .cbr file, or paste a Google Drive folder link to begin.")
 
-    elif message.text:
-        folder_id = extract_drive_id(message.text)
-        if not folder_id:
-            return await message.reply("Could not extract a valid Drive ID from that link.")
-
-        msg = await message.reply("Fetching folder contents via rclone...")
+@app.on_message(filters.document)
+async def handle_document(client, message):
+    print(f"Document received from user {message.from_user.id}", flush=True)
+    
+    file_name = getattr(message.document, "file_name", "") or ""
+    ext = file_name.split('.')[-1].lower() if '.' in file_name else ""
+    
+    if ext not in ['cbz', 'cbr']:
+        return await message.reply("Please send a valid .cbz or .cbr file.")
         
-        cmd = f'rclone lsjson {RCLONE_REMOTE} --drive-root-folder-id "{folder_id}"'
-        proc = await asyncio.create_subprocess_shell(
-            cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
+    msg = await message.reply("Downloading file...")
+    filepath = await message.download()
+    await process_downloaded_archive(msg, filepath)
+
+@app.on_message(filters.text & filters.regex(r"drive\.google\.com"))
+async def handle_link(client, message):
+    print(f"Drive link received from user {message.from_user.id}", flush=True)
+    
+    folder_id = extract_drive_id(message.text)
+    if not folder_id:
+        return await message.reply("Could not extract a valid Drive ID from that link.")
+
+    msg = await message.reply("Fetching folder contents via rclone...")
+    
+    cmd = f'rclone lsjson {RCLONE_REMOTE} --drive-root-folder-id "{folder_id}"'
+    proc = await asyncio.create_subprocess_shell(
+        cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await proc.communicate()
+    
+    if proc.returncode != 0:
+        return await msg.edit(f"Rclone failed to list directory. Check config.\nError: {stderr.decode('utf-8')}")
         
-        if proc.returncode != 0:
-            return await msg.edit(f"Rclone failed to list directory. Check config.\nError: {stderr.decode('utf-8')}")
-            
-        try:
-            items = json.loads(stdout.decode('utf-8'))
-        except json.JSONDecodeError:
-            return await msg.edit("Failed to parse rclone output.")
+    try:
+        items = json.loads(stdout.decode('utf-8'))
+    except json.JSONDecodeError:
+        return await msg.edit("Failed to parse rclone output.")
 
-        valid_files = [i for i in items if not i['IsDir'] and i['Name'].lower().endswith(('.cbz', '.cbr'))]
+    valid_files = [i for i in items if not i['IsDir'] and i['Name'].lower().endswith(('.cbz', '.cbr'))]
 
-        if not valid_files:
-            return await msg.edit("No .cbz or .cbr files found in this folder.")
+    if not valid_files:
+        return await msg.edit("No .cbz or .cbr files found in this folder.")
 
-        buttons = []
-        for item in valid_files:
-            download_id = str(uuid.uuid4())[:8]
-            sessions[f"dl_{download_id}"] = {
-                "folder_id": folder_id,
-                "path": item['Path'],
-                "name": item['Name']
-            }
-            buttons.append([InlineKeyboardButton(item['Name'], callback_data=f"rcdl_{download_id}")])
-        
-        kb = InlineKeyboardMarkup(buttons)
-        await msg.edit("Select a comic archive to read:", reply_markup=kb)
+    buttons = []
+    for item in valid_files:
+        download_id = str(uuid.uuid4())[:8]
+        sessions[f"dl_{download_id}"] = {
+            "folder_id": folder_id,
+            "path": item['Path'],
+            "name": item['Name']
+        }
+        buttons.append([InlineKeyboardButton(item['Name'], callback_data=f"rcdl_{download_id}")])
+    
+    kb = InlineKeyboardMarkup(buttons)
+    await msg.edit("Select a comic archive to read:", reply_markup=kb)
+
+@app.on_message(filters.private & ~filters.document & ~filters.command("start") & ~filters.regex(r"drive\.google\.com"))
+async def catch_all(client, message):
+    print(f"Unrecognized message received: {message.text or 'Non-text media'}", flush=True)
+    await message.reply("I only recognize .cbz files, .cbr files, or Google Drive links.")
 
 @app.on_callback_query(filters.regex(r"^rcdl_(.*)"))
 async def cb_rclone_download(client, callback_query):
@@ -331,9 +347,10 @@ async def main():
     await app.start()
     print("Telegram Bot is online and listening!", flush=True)
     
-    # Keep the script running forever
-    await asyncio.Event().wait()
+    await idle()
+    
+    await app.stop()
+    await runner.cleanup()
 
 if __name__ == "__main__":
-    # Standard asyncio execution loop
     asyncio.run(main())
