@@ -1,4 +1,5 @@
-aiogram
+pyrogram
+tgcrypto
 aiohttp
 rarfile
 remotezip
