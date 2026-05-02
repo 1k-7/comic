@@ -25,7 +25,7 @@ if not BOT_TOKEN or not API_ID:
     raise ValueError("CRITICAL ERROR: BOT_TOKEN or API_ID is missing!")
 
 # Client is defined normally, letting it bind to the active loop later
-app = Client("comic_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("comic_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
 
 # In-memory stores
 sessions = {}      # session_id -> {type, source, pages, total}
