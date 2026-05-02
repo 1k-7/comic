@@ -6,11 +6,13 @@ import asyncio
 import zipfile
 import rarfile
 import re
+import urllib.parse
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, BufferedInputFile
 from aiogram.exceptions import TelegramBadRequest
+from remotezip import RemoteZip
 
 # --- CONFIGURATION ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -24,6 +26,7 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# session_id -> { "type": "stream_cbz" | "local_cbz" | "local_cbr", "source": str, "pages": list, "total": int }
 sessions = {}
 jump_states = {}
 
@@ -34,21 +37,26 @@ def extract_drive_id(url):
     match = re.search(r"id=([a-zA-Z0-9_-]+)", url)
     return match.group(1) if match else None
 
-def get_archive_pages(filepath):
+def get_archive_pages(file_type, source):
     pages = []
-    if filepath.endswith('.cbz'):
-        with zipfile.ZipFile(filepath, 'r') as zf:
+    if file_type == 'stream_cbz':
+        with RemoteZip(source) as zf:
             pages = [f for f in zf.namelist() if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-    elif filepath.endswith('.cbr'):
-        with rarfile.RarFile(filepath, 'r') as rf:
+    elif file_type == 'local_cbz':
+        with zipfile.ZipFile(source, 'r') as zf:
+            pages = [f for f in zf.namelist() if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    elif file_type == 'local_cbr':
+        with rarfile.RarFile(source, 'r') as rf:
             pages = [f for f in rf.namelist() if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
     return sorted(pages)
 
-def extract_page(filepath, filename):
-    if filepath.endswith('.cbz'):
-        with zipfile.ZipFile(filepath, 'r') as zf: return zf.read(filename)
-    elif filepath.endswith('.cbr'):
-        with rarfile.RarFile(filepath, 'r') as rf: return rf.read(filename)
+def extract_page(file_type, source, filename):
+    if file_type == 'stream_cbz':
+        with RemoteZip(source) as zf: return zf.read(filename)
+    elif file_type == 'local_cbz':
+        with zipfile.ZipFile(source, 'r') as zf: return zf.read(filename)
+    elif file_type == 'local_cbr':
+        with rarfile.RarFile(source, 'r') as rf: return rf.read(filename)
     return None
 
 def build_keyboard(session_id, current_page, total_pages):
@@ -109,18 +117,28 @@ async def web_serve_image(request):
     page_idx = int(request.match_info.get('page_idx', 0))
     if session_id not in sessions or page_idx < 0 or page_idx >= sessions[session_id]["total"]:
         return web.Response(status=404)
-    filename = sessions[session_id]["pages"][page_idx]
-    img_bytes = extract_page(sessions[session_id]["filepath"], filename)
+        
+    sess = sessions[session_id]
+    filename = sess["pages"][page_idx]
+    
+    # Run blocking extraction in a background thread to prevent halting the web loop
+    img_bytes = await asyncio.to_thread(extract_page, sess["type"], sess["source"], filename)
     return web.Response(body=img_bytes, content_type='image/jpeg')
 
 # --- BOT LOGIC ---
-async def process_downloaded_archive(message: types.Message, filepath: str, msg_to_edit: types.Message):
+async def register_session_and_prompt(msg_to_edit: types.Message, file_type: str, source: str):
     session_id = str(uuid.uuid4())
-    pages = get_archive_pages(filepath)
+    
+    # Run blocking network/disk I/O in thread
+    try:
+        pages = await asyncio.to_thread(get_archive_pages, file_type, source)
+    except Exception as e:
+        return await msg_to_edit.edit_text(f"Failed to read archive: {str(e)}")
+
     if not pages:
         return await msg_to_edit.edit_text("Archive is empty or corrupted.")
         
-    sessions[session_id] = {"filepath": filepath, "pages": pages, "total": len(pages)}
+    sessions[session_id] = {"type": file_type, "source": source, "pages": pages, "total": len(pages)}
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Read in Browser", callback_data=f"web_{session_id}")],
@@ -136,16 +154,28 @@ async def start_cmd(message: types.Message):
 async def handle_document(message: types.Message):
     file_name = message.document.file_name or ""
     ext = file_name.split('.')[-1].lower() if '.' in file_name else ""
+    
     if ext not in ['cbz', 'cbr']:
         return await message.answer("Please send a valid .cbz or .cbr file.")
         
-    status_msg = await message.answer("Downloading file...")
-    os.makedirs("downloads", exist_ok=True)
-    filepath = f"downloads/{file_name}"
+    if message.document.file_size > 20 * 1024 * 1024:
+        return await message.answer("File is over 20MB. Telegram restricts bots from accessing massive files directly. Please use a Google Drive link.")
+
+    status_msg = await message.answer("Processing file...")
+    file_info = await bot.get_file(message.document.file_id)
     
-    file = await bot.get_file(message.document.file_id)
-    await bot.download_file(file.file_path, filepath)
-    await process_downloaded_archive(message, filepath, status_msg)
+    if ext == 'cbz':
+        # Direct stream from Telegram Bot API URL
+        url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
+        await status_msg.edit_text("Streaming CBZ directly from Telegram...")
+        await register_session_and_prompt(status_msg, "stream_cbz", url)
+    else:
+        # CBR requires full local download for unrar binary
+        await status_msg.edit_text("CBR format requires local extraction. Downloading...")
+        os.makedirs("downloads", exist_ok=True)
+        filepath = f"downloads/{file_name}"
+        await bot.download_file(file_info.file_path, filepath)
+        await register_session_and_prompt(status_msg, "local_cbr", filepath)
 
 @dp.message(F.text.regexp(r"drive\.google\.com"))
 async def handle_link(message: types.Message):
@@ -185,21 +215,32 @@ async def cb_rclone_download(callback: types.CallbackQuery):
     dl_data = sessions.get(f"dl_{download_id}")
     
     if not dl_data:
-        return await callback.answer("Download session expired.", show_alert=True)
+        return await callback.answer("Session expired.", show_alert=True)
         
-    await callback.message.edit_text("Downloading via rclone...")
-    os.makedirs("downloads", exist_ok=True)
-    local_filepath = os.path.join("downloads", dl_data["name"])
+    filename = dl_data["name"]
     
-    cmd = f'rclone copyto "{RCLONE_REMOTE}{dl_data["path"]}" "{local_filepath}" --drive-root-folder-id "{dl_data["folder_id"]}"'
-    proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    _, stderr = await proc.communicate()
-    
-    if proc.returncode != 0:
-        return await callback.message.edit_text(f"Download failed.\nError: {stderr.decode('utf-8')}")
+    if filename.lower().endswith(".cbz"):
+        await callback.message.edit_text("Streaming CBZ directly from Google Drive...")
+        # URL encode the rclone path to safely query the local rclone HTTP server
+        encoded_path = urllib.parse.quote(dl_data["path"])
+        url = f"http://127.0.0.1:8081/{encoded_path}"
+        await register_session_and_prompt(callback.message, "stream_cbz", url)
+        
+    else:
+        await callback.message.edit_text("CBR format requires local extraction. Downloading via rclone...")
+        os.makedirs("downloads", exist_ok=True)
+        local_filepath = os.path.join("downloads", filename)
+        
+        cmd = f'rclone copyto "{RCLONE_REMOTE}{dl_data["path"]}" "{local_filepath}" --drive-root-folder-id "{dl_data["folder_id"]}"'
+        proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        _, stderr = await proc.communicate()
+        
+        if proc.returncode != 0:
+            return await callback.message.edit_text(f"Download failed.\nError: {stderr.decode('utf-8')}")
+
+        await register_session_and_prompt(callback.message, "local_cbr", local_filepath)
 
     del sessions[f"dl_{download_id}"]
-    await process_downloaded_archive(callback.message, local_filepath, callback.message)
 
 @dp.callback_query(F.data.startswith("web_"))
 async def cb_web_read(callback: types.CallbackQuery):
@@ -211,23 +252,27 @@ async def cb_pm_read(callback: types.CallbackQuery):
     parts = callback.data.split("_")
     action, session_id, page_idx = parts[0], parts[1], int(parts[2])
     
-    session = sessions.get(session_id)
-    if not session:
+    sess = sessions.get(session_id)
+    if not sess:
         return await callback.answer("Session expired.", show_alert=True)
         
-    filename = session["pages"][page_idx]
-    img_bytes = extract_page(session["filepath"], filename)
-    photo = BufferedInputFile(img_bytes, filename=filename)
-    kb = build_keyboard(session_id, page_idx, session["total"])
+    filename = sess["pages"][page_idx]
     
-    if action == "pm":
-        await callback.message.delete()
-        await callback.message.answer_photo(photo=photo, reply_markup=kb)
-    elif action == "nav":
-        try:
-            await callback.message.edit_media(media=InputMediaPhoto(media=photo), reply_markup=kb)
-        except TelegramBadRequest:
-            pass # Ignore if image didn't change
+    try:
+        img_bytes = await asyncio.to_thread(extract_page, sess["type"], sess["source"], filename)
+        photo = BufferedInputFile(img_bytes, filename=filename)
+        kb = build_keyboard(session_id, page_idx, sess["total"])
+        
+        if action == "pm":
+            await callback.message.delete()
+            await callback.message.answer_photo(photo=photo, reply_markup=kb)
+        elif action == "nav":
+            try:
+                await callback.message.edit_media(media=InputMediaPhoto(media=photo), reply_markup=kb)
+            except TelegramBadRequest:
+                pass
+    except Exception as e:
+        await callback.answer(f"Failed to load page: {str(e)}", show_alert=True)
 
 @dp.callback_query(F.data.startswith("jump_"))
 async def cb_jump(callback: types.CallbackQuery):
@@ -240,26 +285,29 @@ async def handle_text(message: types.Message):
     user_id = message.from_user.id
     if user_id in jump_states:
         session_id = jump_states[user_id]
-        session = sessions.get(session_id)
+        sess = sessions.get(session_id)
         
-        if not session:
+        if not sess:
             del jump_states[user_id]
             return await message.answer("Session expired.")
             
         try:
             target_page = int(message.text.strip()) - 1
-            if target_page < 0 or target_page >= session["total"]:
-                return await message.answer(f"Invalid. Must be between 1 and {session['total']}.")
+            if target_page < 0 or target_page >= sess["total"]:
+                return await message.answer(f"Invalid. Must be between 1 and {sess['total']}.")
                 
-            filename = session["pages"][target_page]
-            img_bytes = extract_page(session["filepath"], filename)
+            filename = sess["pages"][target_page]
+            img_bytes = await asyncio.to_thread(extract_page, sess["type"], sess["source"], filename)
+            
             photo = BufferedInputFile(img_bytes, filename=filename)
-            kb = build_keyboard(session_id, target_page, session["total"])
+            kb = build_keyboard(session_id, target_page, sess["total"])
             
             await message.answer_photo(photo=photo, reply_markup=kb)
             del jump_states[user_id]
         except ValueError:
             await message.answer("Please send a valid number.")
+        except Exception as e:
+            await message.answer(f"Failed to load page: {str(e)}")
     elif message.text != "/start" and "drive.google.com" not in message.text:
         await message.answer("I only recognize .cbz files, .cbr files, or Google Drive links.")
 
@@ -269,17 +317,23 @@ async def cb_noop(callback: types.CallbackQuery):
 
 # --- STARTUP SCRIPT ---
 async def main():
+    # 1. Start Rclone local HTTP server. This exposes your GDrive to the container at localhost:8081
+    print("Booting local rclone stream server...", flush=True)
+    rclone_cmd = f'rclone serve http "{RCLONE_REMOTE}" --addr 127.0.0.1:8081'
+    asyncio.create_subprocess_shell(rclone_cmd)
+
+    # 2. Start Web Server
     print("Initializing Web Server...", flush=True)
     web_app = web.Application()
     web_app.router.add_get('/read/{session_id}', web_read_page)
     web_app.router.add_get('/api/image/{session_id}/{page_idx}', web_serve_image)
-    
     runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     print(f"Web server active on port {PORT}!", flush=True)
     
+    # 3. Start Bot Polling
     print("Starting Telegram Bot Polling...", flush=True)
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
